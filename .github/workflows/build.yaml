@@ -80,12 +80,12 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      - name: Set up Android SDK & Build Tools
+      - name: Set up Android SDK & Accept Licenses
         uses: android-actions/setup-android@v3
-        with:
-          packages: |
-            build-tools;36.0.0
-            platforms;android-36
+
+      - name: Accept Android SDK Licenses
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || yes | sdkmanager --licenses >/dev/null 2>&1 || true
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
