@@ -83,22 +83,19 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          # Silence the long license wall that was causing the previous step to fail / spam logs
+          # Silence the long license wall
           log-accepted-android-sdk-licenses: false
-          # Ensure we have what compileSdk 36 + modern build-tools need
-          packages: tools platform-tools build-tools;36.0.0 platforms;android-36
+          # 'tools' package is dead (Google removed it ~Sep 2026). Only request packages that still exist.
+          packages: platform-tools build-tools;36.0.0 platforms;android-36
 
       - name: Accept remaining Android SDK Licenses (belt-and-suspenders)
         run: |
           set +e
-          # Accept any remaining licenses non-interactively
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          # Also try the full path in case PATH is not fully set yet
           if [ -n "$ANDROID_HOME" ]; then
             for path in \
               "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
-              "$ANDROID_HOME/cmdline-tools/bin/sdkmanager" \
-              "$ANDROID_HOME/tools/bin/sdkmanager"; do
+              "$ANDROID_HOME/cmdline-tools/bin/sdkmanager"; do
               if [ -x "$path" ]; then
                 yes | "$path" --licenses >/dev/null 2>&1 || true
               fi
@@ -109,8 +106,6 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          # Prefer the project's wrapper (gradle-wrapper.properties pins 9.3.1)
-          # but still allow the action to install it if the wrapper is missing
           gradle-version: '9.3.1'
           cache-read-only: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
 
@@ -201,7 +196,6 @@ jobs:
       - name: Run Lint & Unit Tests
         if: steps.config.outputs.skip_build != 'true'
         run: |
-          # Prefer the project wrapper so the exact Gradle version from gradle-wrapper.properties is used
           if [ -x ./gradlew ]; then
             ./gradlew lintDebug testDebugUnitTest --no-daemon --stacktrace
           else
