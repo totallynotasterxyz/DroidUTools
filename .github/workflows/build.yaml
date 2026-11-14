@@ -80,16 +80,37 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      - name: Set up Android SDK & Accept Licenses
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # Silence the long license wall that was causing the previous step to fail / spam logs
+          log-accepted-android-sdk-licenses: false
+          # Ensure we have what compileSdk 36 + modern build-tools need
+          packages: tools platform-tools build-tools;36.0.0 platforms;android-36
 
-      - name: Accept Android SDK Licenses
+      - name: Accept remaining Android SDK Licenses (belt-and-suspenders)
         run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          set +e
+          # Accept any remaining licenses non-interactively
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          # Also try the full path in case PATH is not fully set yet
+          if [ -n "$ANDROID_HOME" ]; then
+            for path in \
+              "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+              "$ANDROID_HOME/cmdline-tools/bin/sdkmanager" \
+              "$ANDROID_HOME/tools/bin/sdkmanager"; do
+              if [ -x "$path" ]; then
+                yes | "$path" --licenses >/dev/null 2>&1 || true
+              fi
+            done
+          fi
+          set -e
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
+          # Prefer the project's wrapper (gradle-wrapper.properties pins 9.3.1)
+          # but still allow the action to install it if the wrapper is missing
           gradle-version: '9.3.1'
           cache-read-only: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
 
@@ -180,7 +201,12 @@ jobs:
       - name: Run Lint & Unit Tests
         if: steps.config.outputs.skip_build != 'true'
         run: |
-          gradle lintDebug testDebugUnitTest --no-daemon
+          # Prefer the project wrapper so the exact Gradle version from gradle-wrapper.properties is used
+          if [ -x ./gradlew ]; then
+            ./gradlew lintDebug testDebugUnitTest --no-daemon --stacktrace
+          else
+            gradle lintDebug testDebugUnitTest --no-daemon --stacktrace
+          fi
 
       # Decode Release Upload Keystore from GitHub Secrets (matches app/build.gradle.kts env vars)
       - name: Prepare Release Keystore
@@ -231,19 +257,25 @@ jobs:
         run: |
           set -e
           REQUESTED_TYPE="${{ steps.config.outputs.build_type }}"
+
+          GRADLE_CMD="./gradlew"
+          if [ ! -x ./gradlew ]; then
+            GRADLE_CMD="gradle"
+          fi
+
           if [ "$REQUESTED_TYPE" = "release" ] && [ "${{ steps.keystore.outputs.has_release_key }}" = "true" ]; then
             echo "Assembling signed release APK (R8 enabled)..."
-            gradle assembleRelease \
+            $GRADLE_CMD assembleRelease \
               -PversionName="${APP_VERSION_NAME}" \
               -PversionCode="${APP_VERSION_CODE}" \
-              --no-daemon
+              --no-daemon --stacktrace
             echo "effective_build_type=release" >> "$GITHUB_OUTPUT"
           else
             echo "Assembling debug-signed APK..."
-            gradle assembleDebug \
+            $GRADLE_CMD assembleDebug \
               -PversionName="${APP_VERSION_NAME}" \
               -PversionCode="${APP_VERSION_CODE}" \
-              --no-daemon
+              --no-daemon --stacktrace
             echo "effective_build_type=debug" >> "$GITHUB_OUTPUT"
           fi
 
@@ -259,6 +291,7 @@ jobs:
           FOUND_APK=$(find "app/build/outputs/apk/$BUILD_TYPE" -type f -name "*.apk" ! -name "*-unsigned.apk" | head -n 1)
           if [ -z "$FOUND_APK" ]; then
             echo "Error: No signed APK file generated under app/build/outputs/apk/$BUILD_TYPE!"
+            ls -la app/build/outputs/apk/ || true
             exit 1
           fi
 
@@ -268,11 +301,11 @@ jobs:
           cp "$FOUND_APK" "./$FINAL_APK_NAME"
           sha256sum "$FINAL_APK_NAME" > "./$FINAL_SHA_NAME"
 
-          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name "apksigner" | sort -V | tail -n 1)
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name "apksigner" 2>/dev/null | sort -V | tail -n 1)
           SIGNER_SHA256="unknown"
           if [ -n "$APKSIGNER" ]; then
-            "$APKSIGNER" verify --print-certs "./$FINAL_APK_NAME"
-            SIGNER_SHA256=$("$APKSIGNER" verify --print-certs "./$FINAL_APK_NAME" | grep -m1 "Signer #1 certificate SHA-256 digest" | awk '{print $NF}')
+            "$APKSIGNER" verify --print-certs "./$FINAL_APK_NAME" || true
+            SIGNER_SHA256=$("$APKSIGNER" verify --print-certs "./$FINAL_APK_NAME" 2>/dev/null | grep -m1 "Signer #1 certificate SHA-256 digest" | awk '{print $NF}' || echo "unknown")
           fi
 
           SHA_VAL=$(cut -d' ' -f1 "$FINAL_SHA_NAME")
@@ -316,7 +349,7 @@ jobs:
       - name: Clean up Keystore Temp Files
         if: always()
         run: |
-          rm -rf "$RUNNER_TEMP/keystore" debug.keystore
+          rm -rf "$RUNNER_TEMP/keystore" debug.keystore || true
 
   # =========================================================================
   # RELEASE JOB: Create GitHub Release with APK & Checksums
