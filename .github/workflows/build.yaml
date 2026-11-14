@@ -1,0 +1,438 @@
+name: DroidUtools CI/CD
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*.*.*' ]
+  pull_request:
+    branches: [ main, master ]
+  schedule:
+    # Nightly build at 02:00 UTC daily (opt-in via repository variable ENABLE_NIGHTLY=true)
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Android Build Type'
+        required: true
+        type: choice
+        options:
+          - release
+          - debug
+        default: release
+      create_release:
+        description: 'Create a GitHub Release from build output'
+        required: false
+        type: boolean
+        default: false
+      prerelease:
+        description: 'Mark release as Pre-release / Beta'
+        required: false
+        type: boolean
+        default: false
+      release_notes:
+        description: 'Custom release notes (leave blank for auto-generated log)'
+        required: false
+        type: string
+        default: ''
+
+# Cancel superseded runs on the same branch / reference
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # =========================================================================
+  # BUILD JOB: Verify, test, sign, and package APK + SHA-256
+  # =========================================================================
+  build:
+    name: Build & Package APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write      # Required for GitHub build provenance attestation
+      attestations: write  # Required by actions/attest-build-provenance
+
+    outputs:
+      version_name: ${{ steps.versioning.outputs.version_name }}
+      version_code: ${{ steps.versioning.outputs.version_code }}
+      build_type: ${{ steps.package.outputs.effective_build_type }}
+      apk_name: ${{ steps.package.outputs.apk_name }}
+      apk_path: ${{ steps.package.outputs.apk_path }}
+      sha256_name: ${{ steps.package.outputs.sha256_name }}
+      sha256_path: ${{ steps.package.outputs.sha256_path }}
+      is_nightly: ${{ steps.config.outputs.is_nightly }}
+      should_publish_release: ${{ steps.config.outputs.should_publish_release }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@8df103947385d0336c661fb342a59f2394c7be54 # v4.3.0
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Set up Android SDK & Build Tools
+        uses: android-actions/setup-android@b846ff97fbe5ea5fc8faee3fc97c3697eb4b209e # v3.2.1
+        with:
+          packages: |
+            build-tools;36.0.0
+            platforms;android-36
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@94b5068f5732d9d3e8a543507413676efd0b8f41 # v4.0.0
+        with:
+          gradle-version: '9.3.1'
+          cache-read-only: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
+
+      - name: Determine Build Parameters
+        id: config
+        run: |
+          set -e
+          BUILD_TYPE="release"
+          IS_NIGHTLY="false"
+          SHOULD_PUBLISH="false"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            BUILD_TYPE="${{ inputs.build_type }}"
+            if [ "${{ inputs.create_release }}" = "true" ]; then
+              SHOULD_PUBLISH="true"
+            fi
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            if [ "${{ vars.ENABLE_NIGHTLY }}" = "true" ]; then
+              LAST_NIGHTLY_SHA=$(git rev-parse --verify "refs/tags/nightly^{commit}" 2>/dev/null || echo "")
+              HEAD_SHA=$(git rev-parse HEAD)
+              if [ -z "$LAST_NIGHTLY_SHA" ] || [ "$LAST_NIGHTLY_SHA" != "$HEAD_SHA" ]; then
+                echo "Nightly schedule detected new commits ($HEAD_SHA vs ${LAST_NIGHTLY_SHA:-none})."
+                BUILD_TYPE="release"
+                IS_NIGHTLY="true"
+                SHOULD_PUBLISH="true"
+              else
+                echo "No new commits since last nightly release ($LAST_NIGHTLY_SHA). Skipping."
+                echo "skip_build=true" >> "$GITHUB_OUTPUT"
+              fi
+            else
+              echo "ENABLE_NIGHTLY variable is not 'true'. Skipping nightly build."
+              echo "skip_build=true" >> "$GITHUB_OUTPUT"
+            fi
+          elif [ "${{ startsWith(github.ref, 'refs/tags/v') }}" = "true" ]; then
+            BUILD_TYPE="release"
+            SHOULD_PUBLISH="true"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            BUILD_TYPE="debug"
+          fi
+
+          echo "build_type=$BUILD_TYPE" >> "$GITHUB_OUTPUT"
+          echo "is_nightly=$IS_NIGHTLY" >> "$GITHUB_OUTPUT"
+          echo "should_publish_release=$SHOULD_PUBLISH" >> "$GITHUB_OUTPUT"
+
+      - name: Calculate Versioning
+        id: versioning
+        if: steps.config.outputs.skip_build != 'true'
+        run: |
+          set -e
+          COMMIT_COUNT=$(git rev-list --count HEAD 2>/dev/null || echo "1")
+          VERSION_CODE=$((COMMIT_COUNT + 100))
+
+          if [[ "${{ github.ref }}" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            VERSION_NAME="${GITHUB_REF_NAME#v}"
+          elif [ "${{ steps.config.outputs.is_nightly }}" = "true" ]; then
+            VERSION_NAME="nightly-$(date +'%Y%m%d')"
+          else
+            VERSION_NAME="1.1.0-dev.${VERSION_CODE}"
+          fi
+
+          echo "VERSION_NAME=$VERSION_NAME"
+          echo "VERSION_CODE=$VERSION_CODE"
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+
+      # Decode persistent debug.keystore.base64 so debugConfig signing works cleanly across all CI builds
+      - name: Prepare Debug Keystore
+        if: steps.config.outputs.skip_build != 'true'
+        run: |
+          set -e
+          if [ -f debug.keystore.base64 ] && [ -s debug.keystore.base64 ]; then
+            tr -d '\r\n' < debug.keystore.base64 | base64 -d > debug.keystore
+            echo "Decoded debug.keystore from debug.keystore.base64."
+          elif [ ! -f debug.keystore ]; then
+            keytool -genkeypair -v \
+              -keystore debug.keystore \
+              -storetype PKCS12 \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -alias androiddebugkey \
+              -storepass android \
+              -keypass android \
+              -dname "CN=Android Debug,O=Android,C=US"
+            echo "Generated fallback debug.keystore."
+          fi
+
+      - name: Run Lint & Unit Tests
+        if: steps.config.outputs.skip_build != 'true'
+        run: |
+          gradle lintDebug testDebugUnitTest --no-daemon
+
+      # Decode Release Upload Keystore from GitHub Secrets (matches app/build.gradle.kts env vars)
+      - name: Prepare Release Keystore
+        id: keystore
+        if: steps.config.outputs.skip_build != 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          STORE_PASSWORD_ALT: ${{ secrets.STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -e
+          EFFECTIVE_STORE_PASS="${KEYSTORE_PASSWORD:-$STORE_PASSWORD_ALT}"
+          EFFECTIVE_ALIAS="${KEY_ALIAS:-upload}"
+          EFFECTIVE_KEY_PASS="${KEY_PASSWORD:-$EFFECTIVE_STORE_PASS}"
+
+          KEYSTORE_DIR="$RUNNER_TEMP/keystore"
+          mkdir -p "$KEYSTORE_DIR"
+          KEYSTORE_PATH="$KEYSTORE_DIR/release.jks"
+
+          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$EFFECTIVE_STORE_PASS" ]; then
+            printf '%s' "$KEYSTORE_BASE64" | tr -d '\r\n' | base64 -d > "$KEYSTORE_PATH"
+            keytool -list -keystore "$KEYSTORE_PATH" -storepass "$EFFECTIVE_STORE_PASS" -alias "$EFFECTIVE_ALIAS" >/dev/null
+            echo "has_release_key=true" >> "$GITHUB_OUTPUT"
+            echo "keystore_path=$KEYSTORE_PATH" >> "$GITHUB_OUTPUT"
+            echo "resolved_alias=$EFFECTIVE_ALIAS" >> "$GITHUB_OUTPUT"
+            echo "Validated release upload keystore (alias: $EFFECTIVE_ALIAS)."
+          else
+            echo "has_release_key=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Release keystore secrets (KEYSTORE_BASE64, KEYSTORE_PASSWORD) not configured. Signing with repository debug.keystore so consecutive CI builds share the same signature."
+            {
+              echo "### ⚠️ Release Keystore Secrets Not Configured"
+              echo "Add \`KEYSTORE_BASE64\`, \`KEYSTORE_PASSWORD\`, \`KEY_ALIAS\`, and \`KEY_PASSWORD\` under **Settings → Secrets and variables → Actions** for R8-minified release builds. Falling back to \`debug.keystore.base64\` signing so builds remain update-compatible."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Assemble APK
+        id: build_apk
+        if: steps.config.outputs.skip_build != 'true'
+        env:
+          KEYSTORE_PATH: ${{ steps.keystore.outputs.keystore_path }}
+          STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || secrets.STORE_PASSWORD }}
+          KEY_ALIAS: ${{ steps.keystore.outputs.resolved_alias }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || secrets.KEYSTORE_PASSWORD || secrets.STORE_PASSWORD }}
+          APP_VERSION_NAME: ${{ steps.versioning.outputs.version_name }}
+          APP_VERSION_CODE: ${{ steps.versioning.outputs.version_code }}
+        run: |
+          set -e
+          REQUESTED_TYPE="${{ steps.config.outputs.build_type }}"
+          if [ "$REQUESTED_TYPE" = "release" ] && [ "${{ steps.keystore.outputs.has_release_key }}" = "true" ]; then
+            echo "Assembling signed release APK (R8 enabled)..."
+            gradle assembleRelease \
+              -PversionName="${APP_VERSION_NAME}" \
+              -PversionCode="${APP_VERSION_CODE}" \
+              --no-daemon
+            echo "effective_build_type=release" >> "$GITHUB_OUTPUT"
+          else
+            echo "Assembling debug-signed APK..."
+            gradle assembleDebug \
+              -PversionName="${APP_VERSION_NAME}" \
+              -PversionCode="${APP_VERSION_CODE}" \
+              --no-daemon
+            echo "effective_build_type=debug" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package Output Artifacts & Verify Signature
+        id: package
+        if: steps.config.outputs.skip_build != 'true'
+        run: |
+          set -e
+          VERSION_NAME="${{ steps.versioning.outputs.version_name }}"
+          VERSION_CODE="${{ steps.versioning.outputs.version_code }}"
+          BUILD_TYPE="${{ steps.build_apk.outputs.effective_build_type }}"
+
+          FOUND_APK=$(find "app/build/outputs/apk/$BUILD_TYPE" -type f -name "*.apk" ! -name "*-unsigned.apk" | head -n 1)
+          if [ -z "$FOUND_APK" ]; then
+            echo "Error: No signed APK file generated under app/build/outputs/apk/$BUILD_TYPE!"
+            exit 1
+          fi
+
+          FINAL_APK_NAME="DroidUtools-v${VERSION_NAME}-${VERSION_CODE}-${BUILD_TYPE}.apk"
+          FINAL_SHA_NAME="${FINAL_APK_NAME}.sha256"
+
+          cp "$FOUND_APK" "./$FINAL_APK_NAME"
+          sha256sum "$FINAL_APK_NAME" > "./$FINAL_SHA_NAME"
+
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name "apksigner" | sort -V | tail -n 1)
+          SIGNER_SHA256="unknown"
+          if [ -n "$APKSIGNER" ]; then
+            "$APKSIGNER" verify --print-certs "./$FINAL_APK_NAME"
+            SIGNER_SHA256=$("$APKSIGNER" verify --print-certs "./$FINAL_APK_NAME" | grep -m1 "Signer #1 certificate SHA-256 digest" | awk '{print $NF}')
+          fi
+
+          SHA_VAL=$(cut -d' ' -f1 "$FINAL_SHA_NAME")
+          FILE_SIZE=$(du -h "$FINAL_APK_NAME" | cut -f1)
+
+          echo "effective_build_type=$BUILD_TYPE" >> "$GITHUB_OUTPUT"
+          echo "apk_name=$FINAL_APK_NAME" >> "$GITHUB_OUTPUT"
+          echo "apk_path=$(pwd)/$FINAL_APK_NAME" >> "$GITHUB_OUTPUT"
+          echo "sha256_name=$FINAL_SHA_NAME" >> "$GITHUB_OUTPUT"
+          echo "sha256_path=$(pwd)/$FINAL_SHA_NAME" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## 📦 DroidUtools Build Summary"
+            echo "| Property | Value |"
+            echo "| :--- | :--- |"
+            echo "| **Artifact Name** | \`$FINAL_APK_NAME\` |"
+            echo "| **Version Name** | \`$VERSION_NAME\` |"
+            echo "| **Version Code** | \`$VERSION_CODE\` |"
+            echo "| **Build Type** | \`$BUILD_TYPE\` |"
+            echo "| **File Size** | \`$FILE_SIZE\` |"
+            echo "| **APK SHA-256** | \`$SHA_VAL\` |"
+            echo "| **Signing Cert SHA-256** | \`$SIGNER_SHA256\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest Build Provenance
+        if: steps.config.outputs.skip_build != 'true' && steps.package.outputs.effective_build_type == 'release'
+        uses: actions/attest-build-provenance@c074443f1a5cf4a488655b087771423a1fc614fa # v2.2.3
+        with:
+          subject-path: ${{ steps.package.outputs.apk_path }}
+
+      - name: Upload Build Artifacts
+        if: steps.config.outputs.skip_build != 'true'
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        with:
+          name: ${{ steps.package.outputs.apk_name }}
+          path: |
+            ${{ steps.package.outputs.apk_path }}
+            ${{ steps.package.outputs.sha256_path }}
+          retention-days: 30
+
+      - name: Clean up Keystore Temp Files
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/keystore" debug.keystore
+
+  # =========================================================================
+  # RELEASE JOB: Create GitHub Release with APK & Checksums
+  # =========================================================================
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: needs.build.outputs.should_publish_release == 'true' && needs.build.outputs.apk_name != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository for Release Notes
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4.1.9
+        with:
+          name: ${{ needs.build.outputs.apk_name }}
+          path: release-assets
+
+      - name: Generate Release Notes
+        id: notes
+        run: |
+          set -e
+          CUSTOM_NOTES="${{ inputs.release_notes }}"
+          if [ -n "$CUSTOM_NOTES" ]; then
+            echo "$CUSTOM_NOTES" > RELEASE_NOTES.md
+          else
+            export LAST_TAG=$(git describe --tags --abbrev=0 --exclude='nightly*' HEAD^ 2>/dev/null || git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+            echo "### What's New in DroidUtools v${{ needs.build.outputs.version_name }}" > RELEASE_NOTES.md
+            echo "" >> RELEASE_NOTES.md
+
+            if [ -n "$LAST_TAG" ]; then
+              echo "Changes since **$LAST_TAG**:" >> RELEASE_NOTES.md
+            else
+              echo "Recent changes:" >> RELEASE_NOTES.md
+            fi
+            echo "" >> RELEASE_NOTES.md
+
+            python3 - <<'PYEOF' >> RELEASE_NOTES.md
+          import os, subprocess
+
+          last_tag = os.environ.get("LAST_TAG", "")
+          cmd = ["git", "log", "--no-merges", "--pretty=format:%s (%h)"]
+          if last_tag:
+              cmd.append(f"{last_tag}..HEAD")
+          else:
+              cmd.extend(["-n", "30", "HEAD"])
+
+          out = subprocess.check_output(cmd, text=True).strip()
+          lines = [l for l in out.splitlines() if l.strip()]
+
+          groups = {
+              "Features": [],
+              "Bug Fixes": [],
+              "CI, Build & Dependencies": [],
+              "Other Changes": []
+          }
+          for line in lines:
+              lower = line.lower()
+              if lower.startswith(("feat:", "feat(")):
+                  groups["Features"].append(line)
+              elif lower.startswith(("fix:", "fix(")):
+                  groups["Bug Fixes"].append(line)
+              elif lower.startswith(("ci:", "ci(", "build:", "build(", "deps:", "chore(")):
+                  groups["CI, Build & Dependencies"].append(line)
+              else:
+                  groups["Other Changes"].append(line)
+
+          for heading, items in groups.items():
+              if items:
+                  print(f"#### {heading}")
+                  for item in items:
+                      print(f"* {item}")
+                  print("")
+          PYEOF
+
+            echo "---" >> RELEASE_NOTES.md
+            echo "### 🔒 Integrity Checksum" >> RELEASE_NOTES.md
+            while read -r line; do
+              echo "\`\`\`" >> RELEASE_NOTES.md
+              echo "$line" >> RELEASE_NOTES.md
+              echo "\`\`\`" >> RELEASE_NOTES.md
+            done < "release-assets/${{ needs.build.outputs.sha256_name }}"
+          fi
+
+      - name: Determine Release Tag
+        id: tag
+        run: |
+          if [ "${{ needs.build.outputs.is_nightly }}" = "true" ]; then
+            TAG_NAME="nightly"
+            IS_PRE="true"
+          elif [ "${{ startsWith(github.ref, 'refs/tags/v') }}" = "true" ]; then
+            TAG_NAME="${GITHUB_REF_NAME}"
+            IS_PRE="${{ inputs.prerelease || 'false' }}"
+          else
+            TAG_NAME="v${{ needs.build.outputs.version_name }}"
+            IS_PRE="${{ inputs.prerelease || 'false' }}"
+          fi
+
+          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=$IS_PRE" >> "$GITHUB_OUTPUT"
+
+      - name: Publish Release to GitHub
+        uses: softprops/action-gh-release@c95fe14893b0c4ab80eb56380b32200da7148a0f # v2.2.1
+        with:
+          tag_name: ${{ steps.tag.outputs.tag_name }}
+          name: "DroidUtools v${{ needs.build.outputs.version_name }}"
+          body_path: RELEASE_NOTES.md
+          draft: false
+          prerelease: ${{ steps.tag.outputs.is_prerelease == 'true' }}
+          files: |
+            release-assets/${{ needs.build.outputs.apk_name }}
+            release-assets/${{ needs.build.outputs.sha256_name }}

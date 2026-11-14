@@ -1,0 +1,90 @@
+[
+  {
+    "id": "apple",
+    "name": "Apple Inc. (Apple ID & Developer Portal)",
+    "category": "Authentication & Code Signing",
+    "data_summary": "Your Apple ID email, password, and two-factor code are submitted directly to Apple servers (gsa.apple.com / developer.apple.com) to generate signing certificates and provisioning profiles. The Developer never receives these credentials.",
+    "official_url": "https://www.apple.com/legal/privacy/",
+    "license": "Proprietary / Terms of Service"
+  },
+  {
+    "id": "anisette",
+    "name": "Anisette Authentication Server",
+    "category": "Attestation Headers",
+    "data_summary": "Simulates macOS/iCloud device attestation headers (X-Apple-I-MD-M / X-Apple-I-MD) required for Apple ID login. Apple ID login payloads pass through the configured anisette server. Only use servers you trust.",
+    "official_url": "https://github.com/Dadoum/anisette-v3-server",
+    "license": "AGPL-3.0-or-later / Third-Party Terms"
+  },
+  {
+    "id": "sidestore",
+    "name": "SideStore",
+    "category": "Sideloading Client",
+    "data_summary": "Installs on the target iOS device to manage app refreshing over a local loopback VPN using your pairing record. No user data is transmitted to SideStore maintainers; pairing records remain on your local devices.",
+    "official_url": "https://sidestore.io",
+    "license": "GPL-3.0-or-later"
+  },
+  {
+    "id": "livecontainer",
+    "name": "LiveContainer",
+    "category": "JIT App Runner",
+    "data_summary": "Executes guest iOS apps inside a shared entitlement container without consuming additional free developer App ID slots. All execution occurs completely locally on the iOS device.",
+    "official_url": "https://github.com/khanhduytran0/LiveContainer",
+    "license": "GPL-3.0-or-later"
+  },
+  {
+    "id": "stikdebug",
+    "name": "StikDebug",
+    "category": "JIT & Debug Tunnel",
+    "data_summary": "Facilitates debugserver pairing and JIT enablement on iOS 17+. Tunnel negotiation occurs over local USB or Wi-Fi sockets directly between the Android phone and iOS device.",
+    "official_url": "https://github.com/nythepegasus/StikDebug",
+    "license": "GPL-3.0-or-later"
+  },
+  {
+    "id": "ipa_hosts",
+    "name": "Public Download Hosts & Repositories",
+    "category": "Asset Downloads",
+    "data_summary": "When downloading IPAs or developer disk images from remote URLs (such as GitHub Releases), your Android device's IP address and standard HTTP request headers are received by the host.",
+    "official_url": "https://github.com",
+    "license": "Host Provider Terms of Service"
+  },
+  {
+    "id": "libimobiledevice",
+    "name": "libimobiledevice & usbmuxd",
+    "category": "Core iOS Protocol Libraries",
+    "data_summary": "Open-source software libraries communicating with iOS services over raw USB sockets. All protocol negotiation and data parsing happens completely on-device without internet access.",
+    "official_url": "https://libimobiledevice.org",
+    "license": "LGPL-2.1-or-later / GPL-3.0-or-later"
+  },
+  {
+    "id": "pymobiledevice3",
+    "name": "pymobiledevice3",
+    "category": "RemoteXPC & DDI Integration",
+    "data_summary": "Python implementation of RemoteXPC, RemotePairing, and CoreDevice. Runs locally inside Chaquopy on your Android device.",
+    "official_url": "https://github.com/doronz88/pymobiledevice3",
+    "license": "GPL-3.0-or-later"
+  },
+  {
+    "id": "zsign",
+    "name": "zsign",
+    "category": "Local Code Signer",
+    "data_summary": "Parses Mach-O binaries and code directories locally, signs them using your .p12 certificate and provisioning profile, and repacks the IPA on-device.",
+    "official_url": "https://github.com/zhlynn/zsign",
+    "license": "MIT License"
+  },
+  {
+    "id": "libsu",
+    "name": "libsu",
+    "category": "Root Shell Framework",
+    "data_summary": "Manages communication with the Android system root daemon (Magisk/KernelSU) to spawn usbmuxd and grant raw USB device file access.",
+    "official_url": "https://github.com/topjohnwu/libsu",
+    "license": "Apache License 2.0"
+  },
+  {
+    "id": "github",
+    "name": "GitHub Inc. (Releases & Updates)",
+    "category": "Application Updates & Source Code",
+    "data_summary": "When in-app update checks are enabled, the app contacts the GitHub Releases API to discover new versions and download signed APKs. GitHub receives your IP address and standard HTTP request headers. No personal data or device identifiers are sent.",
+    "official_url": "https://docs.github.com/en/site-policy/privacy-policies/github-privacy-statement",
+    "license": "GitHub Terms of Service"
+  }
+]

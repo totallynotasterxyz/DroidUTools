@@ -1,0 +1,6 @@
+{
+  "name": "DroidUtools",
+  "description": "Full-featured iOS device manager (3uTools alternative) for rooted Android USB host devices",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
